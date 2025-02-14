@@ -22,7 +22,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Deepseek model."""
+import os
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -96,11 +98,14 @@ class DeepseekMoE(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
         self.rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.layer_idx = layer_idx
+        self.expert_tracker = None  # Will be set by model if tracking enabled
         self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         if self.tp_size > self.n_routed_experts:
@@ -160,13 +165,24 @@ class DeepseekMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        
+        # Record expert selections if tracking enabled
+        if self.expert_tracker is not None and self.layer_idx is not None:
+            # Get normalized expert weights
+            expert_weights = torch.softmax(router_logits, dim=-1)
+            self.expert_tracker.record_selections(
+                self.layer_idx,
+                hidden_states,
+                expert_weights
+            )
+            
         final_hidden_states = fused_moe(hidden_states,
-                                        self.w1,
-                                        self.w2,
-                                        router_logits,
-                                        self.top_k,
-                                        renormalize=self.config.norm_topk_prob,
-                                        inplace=True)
+                                      self.w1,
+                                      self.w2,
+                                      router_logits,
+                                      self.top_k,
+                                      renormalize=self.config.norm_topk_prob,
+                                      inplace=True)
 
         if self.config.n_shared_experts is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -290,8 +306,9 @@ class DeepseekDecoderLayer(nn.Module):
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
             self.mlp = DeepseekMoE(config=config,
-                                   quant_config=quant_config,
-                                   prefix=f"{prefix}.mlp")
+                                  quant_config=quant_config,
+                                  prefix=f"{prefix}.mlp",
+                                  layer_idx=layer_idx)
         else:
             self.mlp = DeepseekMLP(
                 hidden_size=config.hidden_size,
@@ -334,6 +351,75 @@ class DeepseekDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+@dataclass
+class ExpertSelectionData:
+    """Stores expert selection patterns for a single forward pass"""
+    token_embeddings: torch.Tensor  # Shape: [num_tokens, hidden_dim]
+    expert_selections: Dict[int, torch.Tensor]  # Layer -> [num_tokens, num_experts]
+    
+class ExpertTracker:
+    """Tracks and stores expert selection patterns across MoE layers"""
+    
+    def __init__(self, hidden_size: int, num_experts: int):
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.selections: List[ExpertSelectionData] = []
+        self.save_dir = os.getenv("VLLM_EXPERT_TRACKER_DIR", "expert_tracking")
+        os.makedirs(self.save_dir, exist_ok=True)
+        
+    def record_selections(self, 
+                         layer_idx: int,
+                         token_embeddings: torch.Tensor,
+                         expert_weights: torch.Tensor) -> None:
+        """Record expert selection weights for tokens at a specific layer"""
+        # Detach and move to CPU to avoid memory buildup
+        embeddings = token_embeddings.detach().cpu()
+        weights = expert_weights.detach().cpu()
+        
+        # Create new selection data if this is first layer
+        if not self.selections or layer_idx == 0:
+            self.selections.append(ExpertSelectionData(
+                token_embeddings=embeddings,
+                expert_selections={layer_idx: weights}
+            ))
+        else:
+            # Add to existing selection data
+            self.selections[-1].expert_selections[layer_idx] = weights
+            
+    def get_training_data(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert recorded data into training pairs"""
+        all_embeddings = []
+        all_selections = []
+        
+        for data in self.selections:
+            embeddings = data.token_embeddings
+            # Create expert selection matrix [num_tokens, num_layers, num_experts]
+            max_layer = max(data.expert_selections.keys())
+            selections = torch.zeros(
+                embeddings.size(0), max_layer + 1, self.num_experts)
+            
+            for layer_idx, layer_selections in data.expert_selections.items():
+                selections[:, layer_idx, :] = layer_selections
+                
+            all_embeddings.append(embeddings)
+            all_selections.append(selections)
+            
+        embeddings = torch.cat(all_embeddings, dim=0)
+        selections = torch.cat(all_selections, dim=0)
+        
+        # Save the data
+        save_path = os.path.join(self.save_dir, f"expert_data_{len(self.selections)}.pt")
+        torch.save({
+            'embeddings': embeddings,
+            'selections': selections
+        }, save_path)
+            
+        return embeddings, selections
+                
+    def clear(self):
+        """Clear recorded data"""
+        self.selections.clear()
+
 class DeepseekModel(nn.Module):
 
     fall_back_to_pt_during_load = False
@@ -352,12 +438,25 @@ class DeepseekModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        self.expert_tracker = None
+        if os.getenv("VLLM_EXPERT_TRACKING") and hasattr(config, 'n_routed_experts'):
+            self.expert_tracker = ExpertTracker(
+                hidden_size=config.hidden_size,
+                num_experts=config.n_routed_experts
+            )
+            
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekDecoderLayer(
                 config, cache_config, quant_config=quant_config, prefix=prefix
             ),
             prefix=f"{prefix}.layers")
+            
+        # Set expert tracker for MoE layers
+        if self.expert_tracker is not None:
+            for layer in self.layers:
+                if hasattr(layer.mlp, 'expert_tracker'):
+                    layer.mlp.expert_tracker = self.expert_tracker
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
