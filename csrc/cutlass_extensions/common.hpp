@@ -55,7 +55,8 @@ template <typename Kernel>
 struct enable_sm100_only : Kernel {
   template <typename... Args>
   CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ == 1000
+#if defined __CUDA_ARCH__ && \
+    (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1010 || __CUDA_ARCH__ == 1100)
     Kernel::operator()(std::forward<Args>(args)...);
 #endif
   }

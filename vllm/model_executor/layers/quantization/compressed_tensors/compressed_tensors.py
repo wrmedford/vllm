@@ -479,9 +479,10 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_fp8_w8a8_sm100(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:
-        return self._check_scheme_supported(
-            100, error=False, match_exact=True
-        ) and self._is_fp8_w8a8(weight_quant, input_quant)
+        capability = current_platform.get_device_capability()
+        if capability is None or capability.to_int() not in (100, 101, 110):
+            return False
+        return self._is_fp8_w8a8(weight_quant, input_quant)
 
     def _is_fp8_w8a16(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs

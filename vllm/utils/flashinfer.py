@@ -218,15 +218,21 @@ def has_nvidia_artifactory() -> bool:
 @functools.cache
 def supports_trtllm_attention() -> bool:
     """
-    TRTLLM attention is supported if the platform is SM100,
+    TRTLLM attention is supported if the platform is SM100-class
+    (SM100/SM101/SM110),
     NVIDIA artifactory is accessible, and batch-invariant mode is not enabled.
     """
     # Batch-invariant mode disables TRTLLM attention
     if vllm_is_batch_invariant():
         return False
 
-    # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
-    return current_platform.is_device_capability(100) and has_nvidia_artifactory()
+    # Requires a Blackwell-class GPU and NVIDIA artifactory access to download cubins
+    capability = current_platform.get_device_capability()
+    return (
+        capability is not None
+        and capability.to_int() in (100, 101, 110)
+        and has_nvidia_artifactory()
+    )
 
 
 @functools.cache
