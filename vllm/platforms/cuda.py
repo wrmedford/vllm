@@ -51,7 +51,7 @@ def _get_backend_priorities(
     from vllm.attention.backends.registry import AttentionBackendEnum
 
     if use_mla:
-        if device_capability.major == 10:
+        if device_capability.major in (10, 11):
             return [
                 AttentionBackendEnum.CUTLASS_MLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
@@ -69,7 +69,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
-        if device_capability.major == 10:
+        if device_capability.major in (10, 11):
             return [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
@@ -105,6 +105,49 @@ class CudaPlatformBase(Platform):
     ray_device_key: str = "GPU"
     dist_backend: str = "nccl"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+
+    _BLACKWELL_CAPABILITY_ALIASES: dict[int, tuple[int, ...]] = {
+        100: (100, 101),
+        101: (100, 101),
+        110: (101, 110),
+    }
+
+    @classmethod
+    def is_device_capability(
+        cls, capability: tuple[int, int] | int, device_id: int = 0
+    ) -> bool:
+        current_capability = cls.get_device_capability(device_id=device_id)
+        if current_capability is None:
+            return False
+
+        if isinstance(capability, tuple):
+            alias_key = capability[0] * 10 + capability[1]
+            alias_values = cls._BLACKWELL_CAPABILITY_ALIASES.get(alias_key)
+            if alias_values is not None:
+                return current_capability.to_int() in alias_values
+            return (current_capability.major, current_capability.minor) == capability
+
+        if isinstance(capability, int):
+            alias_values = cls._BLACKWELL_CAPABILITY_ALIASES.get(capability)
+            if alias_values is not None:
+                return current_capability.to_int() in alias_values
+            return current_capability.to_int() == capability
+
+        return False
+
+    @classmethod
+    def is_blackwell_capability(
+        cls, capability: DeviceCapability | None = None
+    ) -> bool:
+        if capability is None:
+            capability = cls.get_device_capability()
+        if capability is None:
+            return False
+        return (
+            capability.major == 10
+            and capability.minor in (0, 1)
+            or (capability.major == 11 and capability.minor == 0)
+        )
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
@@ -183,7 +226,7 @@ class CudaPlatformBase(Platform):
 
             if envs.VLLM_ATTENTION_BACKEND is None:
                 # Default case
-                if cls.is_device_capability(100):
+                if cls.is_blackwell_capability():
                     # Blackwell => Force CutlassMLA.
                     use_cutlass_mla = True
                     # TODO: This does not work, because the

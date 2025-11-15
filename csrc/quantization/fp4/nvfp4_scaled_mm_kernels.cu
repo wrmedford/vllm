@@ -34,7 +34,9 @@
 
 using namespace cute;
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || \
+    defined(CUTLASS_ARCH_MMA_SM101_SUPPORTED) || \
+    defined(CUTLASS_ARCH_MMA_SM110_SUPPORTED)
 
 // Configuration for M in (256, inf)
 struct sm100_fp4_config_default {
@@ -232,7 +234,7 @@ void cutlass_fp4_gemm_dispatch(torch::Tensor& D, torch::Tensor const& A,
               "Unsupported CUTLASS version. Set VLLM_CUTLASS_SRC_DIR to "
               "a CUTLASS 3.8 source directory to enable support.");
 }
-#endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM101_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM110_SUPPORTED)
 
 #define CHECK_TYPE(x, st, m) \
   TORCH_CHECK(x.scalar_type() == st, ": Inconsistency of Tensor type:", m)
